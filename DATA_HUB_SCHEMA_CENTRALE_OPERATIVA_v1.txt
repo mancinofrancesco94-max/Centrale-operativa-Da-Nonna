@@ -1,0 +1,959 @@
+# Centrale Operativa — Data Hub v1
+## Specifica dati per Claude Code
+
+## Obiettivo
+Costruire un Data Hub PostgreSQL/Supabase multi-azienda e multi-sede, riutilizzabile per business diversi. Da Nonna è il primo tenant e il primo verticale ristorazione.
+
+## 1. Principi obbligatori
+
+1. PostgreSQL come database.
+2. Multi-tenant: `organization_id` su tutte le entità aziendali e `location_id` dove il dato è riferibile a una sede.
+3. Separare gli schemi PostgreSQL: `raw`, `core`, `restaurant`, `finance`, `workforce`, `crm`, `marketing`, `analytics`, `ops`.
+4. Conservare sempre il dato originale ricevuto dalle API.
+5. Mai sovrascrivere il dato fiscale originale.
+6. Per le vendite conservare separatamente `fiscal_date`, `management_date`, timestamp reali e `service_period`.
+7. Tutte le KPI gestionali usano `management_date`.
+8. Tutte le integrazioni devono essere idempotenti.
+9. Ogni record importato conserva `source_system_id`, `external_id`, `source_updated_at` se disponibile.
+10. Timestamp in `timestamptz`; storage UTC; timezone della sede configurabile.
+11. Denaro in `numeric(14,2)` e quantità in `numeric(14,4)`; mai `float` per valori economici.
+12. Tutte le modifiche allo schema via migrations versionate in Git.
+13. Ogni tabella principale ha `created_at` e `updated_at`.
+14. UUID come PK di default.
+15. Struttura riutilizzabile anche per business non ristorativi.
+
+## 2. Schemi PostgreSQL
+
+```sql
+create schema if not exists raw;
+create schema if not exists core;
+create schema if not exists restaurant;
+create schema if not exists finance;
+create schema if not exists workforce;
+create schema if not exists crm;
+create schema if not exists marketing;
+create schema if not exists analytics;
+create schema if not exists ops;
+```
+
+## 3. CORE — struttura comune
+
+### `core.organizations`
+- id uuid PK
+- legal_name text not null
+- trade_name text
+- vat_number text
+- tax_code text
+- business_sector text
+- base_currency char(3) default 'EUR'
+- country_code char(2) default 'IT'
+- timezone text default 'Europe/Rome'
+- active boolean default true
+- created_at timestamptz
+- updated_at timestamptz
+
+### `core.locations`
+- id uuid PK
+- organization_id uuid FK -> core.organizations
+- code text
+- name text not null
+- location_type text
+- address_line1 text
+- city text
+- postal_code text
+- country_code char(2)
+- timezone text
+- active boolean
+- opened_on date
+- closed_on date nullable
+- created_at
+- updated_at
+
+Unique: `(organization_id, code)`
+
+### `core.source_systems`
+Sistemi sorgente: NetFood, SuperBill, Intesa, Nexi, buoni pasto, delivery, Meta, Google, sito.
+- id uuid PK
+- organization_id uuid FK
+- code text
+- name text
+- category text
+- provider text
+- integration_mode text
+- active boolean
+- created_at
+- updated_at
+
+Unique: `(organization_id, code)`
+
+### `core.units_of_measure`
+- id uuid PK
+- code text unique
+- name text
+- dimension text
+- base_unit_code text nullable
+- conversion_factor numeric(18,8) nullable
+
+### `core.tax_rates`
+- id uuid PK
+- organization_id uuid nullable
+- code text
+- rate numeric(6,3)
+- description text
+- valid_from date
+- valid_to date nullable
+
+### `core.parties`
+Anagrafica generica di fornitori/clienti/altri soggetti.
+- id uuid PK
+- organization_id uuid FK
+- party_type text
+- legal_name text
+- display_name text
+- vat_number text
+- tax_code text
+- email text
+- phone text
+- active boolean
+- created_at
+- updated_at
+
+### `core.products`
+Catalogo unico di materie prime, semilavorati, prodotti finiti, prodotti venduti, servizi e voci di spesa.
+- id uuid PK
+- organization_id uuid FK
+- code text
+- name text not null
+- product_type text
+- category text
+- default_uom_id uuid FK
+- tax_rate_id uuid FK nullable
+- sellable boolean
+- purchasable boolean
+- stock_managed boolean
+- active boolean
+- valid_from date
+- valid_to date nullable
+- created_at
+- updated_at
+
+`product_type`: raw_material, semi_finished, finished_good, menu_item, service, expense_item, other.
+
+### `core.product_external_refs`
+Mappatura prodotto interno ↔ codice sorgente.
+- id uuid PK
+- organization_id uuid FK
+- product_id uuid FK
+- source_system_id uuid FK
+- external_id text
+- external_code text
+- external_description text
+- valid_from timestamptz
+- valid_to timestamptz nullable
+- mapping_status text
+- confidence numeric(5,4) nullable
+- created_at
+- updated_at
+
+## 4. RAW — dati originali API
+
+### `raw.ingest_events`
+Registro append-only degli oggetti ricevuti.
+- id uuid PK
+- organization_id uuid FK
+- location_id uuid nullable
+- source_system_id uuid FK
+- entity_type text
+- external_id text
+- source_updated_at timestamptz nullable
+- received_at timestamptz default now()
+- payload jsonb not null
+- payload_hash text
+- processing_status text
+- processed_at timestamptz nullable
+- error_message text nullable
+- created_at timestamptz
+
+Unique: `(source_system_id, entity_type, external_id, payload_hash)`
+
+Regola: il payload originale non si modifica mai.
+
+## 5. VENDITE
+
+### `core.sales_documents`
+- id uuid PK
+- organization_id uuid FK
+- location_id uuid FK
+- source_system_id uuid FK
+- external_id text not null
+- document_number text
+- document_type text
+- status text
+- opened_at timestamptz nullable
+- closed_at timestamptz not null
+- fiscal_issued_at timestamptz nullable
+- fiscal_date date not null
+- management_date date not null
+- service_period text
+- covers integer nullable
+- subtotal_net numeric(14,2)
+- tax_amount numeric(14,2)
+- total_gross numeric(14,2)
+- discount_amount numeric(14,2) default 0
+- rounding_amount numeric(14,2) default 0
+- channel text
+- customer_id uuid nullable
+- source_updated_at timestamptz nullable
+- created_at
+- updated_at
+
+Unique: `(source_system_id, external_id)`
+
+Indici: `(organization_id, management_date)`, `(location_id, management_date)`, `closed_at`, `service_period`, `channel`.
+
+### `core.sales_lines`
+- id uuid PK
+- organization_id uuid FK
+- sales_document_id uuid FK
+- line_number integer
+- source_line_id text nullable
+- product_id uuid nullable FK
+- external_product_code text nullable
+- description text
+- quantity numeric(14,4)
+- uom_id uuid nullable
+- unit_price_gross numeric(14,4)
+- unit_price_net numeric(14,4) nullable
+- gross_amount numeric(14,2)
+- net_amount numeric(14,2) nullable
+- tax_amount numeric(14,2) nullable
+- discount_amount numeric(14,2) default 0
+- tax_rate_id uuid nullable
+- line_type text
+- created_at
+- updated_at
+
+### `core.payment_methods`
+- id uuid PK
+- organization_id uuid FK
+- code text
+- name text
+- method_type text
+- provider text nullable
+- active boolean
+
+Tipi: cash, card, meal_voucher, bank_transfer, delivery_platform, satispay, other.
+
+### `core.sale_payments`
+- id uuid PK
+- organization_id uuid FK
+- sales_document_id uuid FK
+- source_system_id uuid nullable
+- external_id text nullable
+- payment_method_id uuid FK
+- amount numeric(14,2)
+- paid_at timestamptz
+- reference text nullable
+- created_at
+- updated_at
+
+## 6. ACQUISTI / SUPERBILL
+
+### `core.purchase_documents`
+- id uuid PK
+- organization_id uuid FK
+- location_id uuid nullable
+- source_system_id uuid FK
+- external_id text
+- supplier_id uuid FK -> core.parties
+- document_type text
+- document_number text
+- document_date date
+- received_at timestamptz nullable
+- due_date date nullable
+- currency char(3) default 'EUR'
+- net_amount numeric(14,2)
+- tax_amount numeric(14,2)
+- gross_amount numeric(14,2)
+- status text
+- source_updated_at timestamptz nullable
+- raw_event_id uuid nullable
+- created_at
+- updated_at
+
+Unique: `(source_system_id, external_id)`
+
+`document_type`: purchase_invoice, supplier_credit_note, ddt, other.
+
+### `core.purchase_lines`
+- id uuid PK
+- organization_id uuid FK
+- purchase_document_id uuid FK
+- line_number integer
+- product_id uuid nullable FK
+- source_product_code text nullable
+- description text
+- quantity numeric(14,4)
+- uom_id uuid nullable
+- unit_price_net numeric(14,4)
+- discount_amount numeric(14,2) default 0
+- net_amount numeric(14,2)
+- tax_amount numeric(14,2) nullable
+- gross_amount numeric(14,2) nullable
+- tax_rate_id uuid nullable
+- expense_category text nullable
+- created_at
+- updated_at
+
+### `core.supplier_product_refs`
+Apprende la corrispondenza tra descrizione/codice fornitore e prodotto interno.
+- id uuid PK
+- organization_id uuid FK
+- supplier_id uuid FK
+- source_system_id uuid FK
+- supplier_item_code text nullable
+- supplier_description text
+- product_id uuid FK
+- supplier_uom_id uuid nullable
+- conversion_factor numeric(18,8) default 1
+- mapping_status text
+- confidence numeric(5,4)
+- first_seen_at timestamptz
+- last_seen_at timestamptz
+- created_at
+- updated_at
+
+### `core.product_purchase_prices`
+Storico prezzi normalizzati, append-only.
+- id uuid PK
+- organization_id uuid FK
+- location_id uuid nullable
+- product_id uuid FK
+- supplier_id uuid FK
+- purchase_document_line_id uuid FK
+- purchase_date date
+- quantity_base_uom numeric(14,4)
+- unit_price_base_uom numeric(14,4)
+- created_at
+
+## 7. FINANCE
+
+### `finance.payables`
+- id uuid PK
+- organization_id uuid FK
+- location_id uuid nullable
+- purchase_document_id uuid nullable
+- supplier_id uuid FK
+- due_date date
+- original_amount numeric(14,2)
+- paid_amount numeric(14,2) default 0
+- residual_amount numeric(14,2)
+- status text
+- priority text nullable
+- payment_terms text nullable
+- created_at
+- updated_at
+
+Status: open, partial, paid, overdue, cancelled.
+
+### `finance.bank_accounts`
+- id uuid PK
+- organization_id uuid FK
+- source_system_id uuid nullable
+- bank_name text
+- iban_masked text
+- currency char(3)
+- active boolean
+- created_at
+- updated_at
+
+### `finance.bank_transactions`
+- id uuid PK
+- organization_id uuid FK
+- bank_account_id uuid FK
+- source_system_id uuid FK
+- external_id text
+- booked_at timestamptz
+- value_date date nullable
+- amount numeric(14,2)
+- currency char(3)
+- direction text
+- description text
+- counterparty_name text nullable
+- counterparty_iban_masked text nullable
+- reference text nullable
+- transaction_type text nullable
+- source_updated_at timestamptz nullable
+- created_at
+- updated_at
+
+Unique: `(source_system_id, external_id)`
+
+### `finance.reconciliations`
+- id uuid PK
+- organization_id uuid FK
+- reconciliation_type text
+- status text
+- confidence numeric(5,4) nullable
+- matched_amount numeric(14,2)
+- matched_at timestamptz
+- matched_by text
+- notes text nullable
+- created_at
+- updated_at
+
+### `finance.reconciliation_links`
+- id uuid PK
+- reconciliation_id uuid FK
+- entity_type text
+- entity_id uuid
+- amount numeric(14,2) nullable
+- created_at
+
+### `finance.cashflow_items`
+- id uuid PK
+- organization_id uuid FK
+- location_id uuid nullable
+- item_type text
+- source_entity_type text
+- source_entity_id uuid nullable
+- expected_date date
+- actual_date date nullable
+- amount numeric(14,2)
+- direction text
+- status text
+- confidence numeric(5,4) nullable
+- category text
+- created_at
+- updated_at
+
+## 8. WORKFORCE
+
+### `workforce.employees`
+- id uuid PK
+- organization_id uuid FK
+- employee_code text
+- first_name text
+- last_name text
+- role text
+- contract_type text
+- employment_start date
+- employment_end date nullable
+- active boolean
+- created_at
+- updated_at
+
+### `workforce.time_entries`
+- id uuid PK
+- organization_id uuid FK
+- location_id uuid FK
+- employee_id uuid FK
+- work_date date
+- clock_in timestamptz nullable
+- clock_out timestamptz nullable
+- hours numeric(8,2)
+- service_period text nullable
+- source_system_id uuid nullable
+- external_id text nullable
+- status text
+- created_at
+- updated_at
+
+### `workforce.labor_cost_periods`
+- id uuid PK
+- organization_id uuid FK
+- employee_id uuid FK
+- period_start date
+- period_end date
+- gross_salary numeric(14,2)
+- employer_contributions numeric(14,2)
+- accruals numeric(14,2)
+- other_costs numeric(14,2)
+- total_employer_cost numeric(14,2)
+- paid_hours numeric(10,2) nullable
+- effective_hourly_cost numeric(14,4) nullable
+- source text
+- created_at
+- updated_at
+
+## 9. VERTICALE RISTORAZIONE
+
+### `restaurant.recipes`
+- id uuid PK
+- organization_id uuid FK
+- product_id uuid FK
+- name text
+- yield_quantity numeric(14,4)
+- yield_uom_id uuid FK
+- version integer
+- valid_from date
+- valid_to date nullable
+- active boolean
+- created_at
+- updated_at
+
+### `restaurant.recipe_components`
+Distinta base multilivello.
+- id uuid PK
+- recipe_id uuid FK
+- component_product_id uuid FK
+- quantity numeric(14,4)
+- uom_id uuid FK
+- waste_factor numeric(8,5) default 0
+- sequence_no integer nullable
+- created_at
+- updated_at
+
+### `restaurant.production_batches`
+- id uuid PK
+- organization_id uuid FK
+- location_id uuid FK
+- product_id uuid FK
+- recipe_id uuid nullable
+- produced_at timestamptz
+- quantity_produced numeric(14,4)
+- uom_id uuid FK
+- theoretical_cost numeric(14,2) nullable
+- actual_cost numeric(14,2) nullable
+- batch_code text nullable
+- expiry_at timestamptz nullable
+- created_at
+- updated_at
+
+### `restaurant.inventory_movements`
+Ledger append-only di magazzino.
+- id uuid PK
+- organization_id uuid FK
+- location_id uuid FK
+- product_id uuid FK
+- movement_at timestamptz
+- management_date date
+- movement_type text
+- quantity numeric(14,4)
+- uom_id uuid FK
+- unit_cost numeric(14,4) nullable
+- total_cost numeric(14,2) nullable
+- source_entity_type text nullable
+- source_entity_id uuid nullable
+- notes text nullable
+- created_at
+
+Movement types: purchase_receipt, sale_consumption, production_in, production_out, waste, staff_meal, complimentary, transfer_in, transfer_out, inventory_adjustment, opening_balance.
+
+### `restaurant.physical_inventory_counts`
+- id uuid PK
+- organization_id uuid FK
+- location_id uuid FK
+- counted_at timestamptz
+- status text
+- created_at
+- updated_at
+
+### `restaurant.physical_inventory_lines`
+- id uuid PK
+- inventory_count_id uuid FK
+- product_id uuid FK
+- quantity_counted numeric(14,4)
+- uom_id uuid FK
+- theoretical_quantity numeric(14,4) nullable
+- variance_quantity numeric(14,4) nullable
+- unit_cost numeric(14,4) nullable
+- variance_value numeric(14,2) nullable
+- created_at
+
+## 10. CRM / PRENOTAZIONI
+
+### `crm.customers`
+- id uuid PK
+- organization_id uuid FK
+- first_name text nullable
+- last_name text nullable
+- email text nullable
+- phone_e164 text nullable
+- first_seen_at timestamptz
+- last_seen_at timestamptz
+- created_at
+- updated_at
+
+### `crm.consents`
+- id uuid PK
+- organization_id uuid FK
+- customer_id uuid FK
+- channel text
+- purpose text
+- status text
+- consented_at timestamptz nullable
+- revoked_at timestamptz nullable
+- source text
+- evidence jsonb nullable
+- created_at
+- updated_at
+
+### `crm.reservations`
+- id uuid PK
+- organization_id uuid FK
+- location_id uuid FK
+- customer_id uuid nullable
+- source_system_id uuid nullable
+- external_id text nullable
+- reservation_at timestamptz
+- party_size integer
+- status text
+- source_channel text
+- notes text nullable
+- linked_sales_document_id uuid nullable
+- created_at
+- updated_at
+
+## 11. MARKETING
+
+### `marketing.campaigns`
+- id uuid PK
+- organization_id uuid FK
+- source_system_id uuid nullable
+- external_id text nullable
+- name text
+- channel text
+- objective text nullable
+- start_at timestamptz
+- end_at timestamptz nullable
+- budget numeric(14,2) nullable
+- status text
+- created_at
+- updated_at
+
+### `marketing.campaign_daily_metrics`
+- id uuid PK
+- campaign_id uuid FK
+- metric_date date
+- spend numeric(14,2)
+- impressions bigint
+- reach bigint nullable
+- clicks bigint nullable
+- leads bigint nullable
+- reservations bigint nullable
+- attributed_revenue numeric(14,2) nullable
+- attributed_margin numeric(14,2) nullable
+- created_at
+- updated_at
+
+Unique: `(campaign_id, metric_date)`
+
+### `marketing.attribution_events`
+- id uuid PK
+- organization_id uuid FK
+- customer_id uuid nullable
+- campaign_id uuid nullable
+- event_type text
+- event_at timestamptz
+- reservation_id uuid nullable
+- sales_document_id uuid nullable
+- revenue numeric(14,2) nullable
+- margin numeric(14,2) nullable
+- attribution_model text nullable
+- metadata jsonb nullable
+- created_at
+
+## 12. OPS
+
+### `ops.sync_runs`
+- id uuid PK
+- organization_id uuid FK
+- source_system_id uuid FK
+- entity_type text
+- started_at timestamptz
+- finished_at timestamptz nullable
+- status text
+- records_received integer default 0
+- records_inserted integer default 0
+- records_updated integer default 0
+- records_failed integer default 0
+- cursor_value text nullable
+- error_summary text nullable
+- created_at
+
+### `ops.integration_cursors`
+- id uuid PK
+- organization_id uuid FK
+- source_system_id uuid FK
+- entity_type text
+- cursor_type text
+- cursor_value text
+- last_success_at timestamptz nullable
+- updated_at
+
+Unique: `(organization_id, source_system_id, entity_type)`
+
+### `ops.mapping_queue`
+Coda di mapping da validare manualmente.
+- id uuid PK
+- organization_id uuid FK
+- mapping_type text
+- source_system_id uuid FK
+- source_value jsonb
+- proposed_entity_type text
+- proposed_entity_id uuid nullable
+- confidence numeric(5,4) nullable
+- status text
+- resolved_by uuid nullable
+- resolved_at timestamptz nullable
+- created_at
+- updated_at
+
+### `ops.data_quality_issues`
+- id uuid PK
+- organization_id uuid FK
+- severity text
+- issue_type text
+- entity_type text
+- entity_id uuid nullable
+- description text
+- detected_at timestamptz
+- status text
+- resolved_at timestamptz nullable
+- created_at
+- updated_at
+
+### `ops.audit_log`
+- id uuid PK
+- organization_id uuid nullable
+- actor_type text
+- actor_id text nullable
+- action text
+- entity_type text
+- entity_id uuid nullable
+- before_data jsonb nullable
+- after_data jsonb nullable
+- occurred_at timestamptz default now()
+
+## 13. ANALYTICS — viste, non copie inutili
+
+Prime viste/materialized views:
+
+### `analytics.daily_sales`
+Per organization/location/management_date:
+- gross_sales
+- net_sales
+- tax
+- discounts
+- covers
+- average_ticket
+- transactions
+
+### `analytics.sales_by_service_period`
+Per management_date/service_period/location:
+- sales
+- covers
+- average_ticket
+- transactions
+
+### `analytics.daily_labor`
+- worked_hours
+- labor_cost
+- labor_cost_pct_sales
+
+### `analytics.daily_food_cost`
+- theoretical_food_cost
+- food_cost_pct
+- sales
+- gross_margin_pre_labor
+
+### `analytics.daily_management_kpi`
+- revenue
+- covers
+- average_ticket
+- food_cost
+- labour
+- contribution_margin
+- estimated_mol
+- bep
+- variance_vs_target
+- forecast_close
+
+### `analytics.cashflow_90d`
+- date
+- expected_inflows
+- expected_outflows
+- supplier_outflows
+- payroll_outflows
+- fiscal_outflows
+- projected_balance
+
+## 14. REGOLE GESTIONALI CONFIGURABILI
+
+### `core.management_rules`
+Non hardcodare nel frontend le regole importanti.
+- id uuid PK
+- organization_id uuid FK
+- location_id uuid nullable
+- rule_type text
+- rule_key text
+- config jsonb
+- valid_from date
+- valid_to date nullable
+- active boolean
+- created_at
+- updated_at
+
+Esempi: operational_day_cutoff, service_periods, weekly_close_day, weekly_close_time, target_food_cost_pct, target_labor_pct, target_mol_pct, bep_rules.
+
+Esempio `service_periods`:
+```json
+{
+  "breakfast": {"from": "08:30", "to": "12:29"},
+  "lunch": {"from": "12:30", "to": "15:00"},
+  "afternoon": {"from": "15:01", "to": "18:29"},
+  "dinner": {"from": "18:30", "to": "23:59"},
+  "late_service": {"from": "00:00", "to": "03:00", "management_day": "previous"}
+}
+```
+
+Regola: `management_date` deve essere calcolata lato backend/database service, non solo nel frontend. Il cutoff è fallback: se NetFood espone sessione cassa/apertura ordine/identificatore servizio, usare quello come fonte primaria.
+
+## 15. UTENTI / SICUREZZA SUPABASE
+
+### `core.user_profiles`
+- user_id uuid PK -> auth.users
+- default_organization_id uuid
+- first_name text
+- last_name text
+- active boolean
+- created_at
+- updated_at
+
+### `core.user_organization_roles`
+- id uuid PK
+- user_id uuid
+- organization_id uuid
+- role text
+- created_at
+
+Ruoli iniziali: owner, admin, manager, finance, operations, read_only.
+
+Regole:
+- RLS sulle tabelle esposte all'app;
+- mai `service_role` key nel frontend;
+- segreti solo in secret manager/environment variables;
+- audit azioni critiche;
+- evitare dati bancari completi non necessari;
+- backup e restore testati.
+
+## 16. INDICI MINIMI
+
+Indicizzare:
+- FK usate nei join frequenti;
+- management_date;
+- fiscal_date;
+- external_id;
+- source_system_id;
+- organization_id;
+- location_id;
+- document_date;
+- due_date;
+- booked_at;
+- employee_id + work_date;
+- product_id + purchase_date.
+
+## 17. STRATEGIA MIGRATIONS
+
+Non creare tutto in una migration.
+
+1. `001_foundation`: schemas, organizations, locations, source_systems, units_of_measure, tax_rates, utenti/ruoli.
+2. `002_catalog`: parties, products, product_external_refs.
+3. `003_raw_ops`: raw.ingest_events, sync_runs, cursors, mapping_queue, data_quality_issues.
+4. `004_sales`: sales_documents, sales_lines, payment_methods, sale_payments, management_rules.
+5. `005_purchases`: purchase_documents, purchase_lines, supplier_product_refs, product_purchase_prices.
+6. `006_finance`: payables, bank_accounts, bank_transactions, reconciliations, cashflow.
+7. `007_workforce`: employees, time_entries, labor_cost_periods.
+8. `008_restaurant`: recipes, recipe_components, production_batches, inventory movements/counts.
+9. `009_crm_marketing`: customers, consents, reservations, campaigns, metrics, attribution.
+10. `010_analytics`: viste, materialized views, indici finali, quality checks.
+
+## 18. MVP DA COSTRUIRE ORA
+
+Implementare realmente solo:
+1. core.organizations
+2. core.locations
+3. core.source_systems
+4. core.units_of_measure
+5. core.parties
+6. core.products
+7. core.product_external_refs
+8. raw.ingest_events
+9. ops.sync_runs
+10. ops.integration_cursors
+11. ops.mapping_queue
+12. core.management_rules
+13. core.sales_documents
+14. core.sales_lines
+15. core.payment_methods
+16. core.sale_payments
+17. core.purchase_documents
+18. core.purchase_lines
+19. core.supplier_product_refs
+20. core.product_purchase_prices
+
+Obiettivo MVP:
+- SuperBill -> RAW -> purchase_documents/purchase_lines
+- NetFood -> RAW -> sales_documents/sales_lines
+- nessun duplicato
+- dato originale conservato
+- data fiscale separata da data gestionale
+- multi-azienda/multi-sede già pronta
+
+## 19. PROMPT INIZIALE PER CLAUDE CODE
+
+Copia e incolla:
+
+> Stiamo costruendo il Data Hub della “Centrale Operativa”, una piattaforma gestionale multi-azienda e multi-sede. Da Nonna S.r.l. è il primo tenant e il primo verticale ristorazione. Usa PostgreSQL/Supabase.
+>
+> Leggi integralmente `DATA_HUB_SCHEMA_CENTRALE_OPERATIVA_v1.md` e trattalo come source of truth.
+>
+> Prima di scrivere codice:
+> 1. analizza il modello;
+> 2. segnala contraddizioni, ridondanze o rischi;
+> 3. proponi solo le modifiche strettamente necessarie;
+> 4. non modificare il modello senza mia approvazione.
+>
+> Poi implementa esclusivamente il milestone MVP indicato nel documento.
+>
+> Requisiti obbligatori:
+> - migrations versionate;
+> - UUID PK;
+> - multi-tenancy;
+> - raw data append-only;
+> - idempotenza delle integrazioni;
+> - `fiscal_date` e `management_date` separate;
+> - timestamps `timestamptz`;
+> - denaro `numeric`, mai float;
+> - foreign key e unique constraint;
+> - RLS predisposta;
+> - nessuna secret nel codice;
+> - nessuna operazione distruttiva senza approvazione.
+>
+> Non creare ancora Next.js, dashboard, AI, finance avanzata, CRM o marketing.
+>
+> Il primo obiettivo tecnico è rendere possibile:
+> `SuperBill -> RAW -> acquisti normalizzati`
+> e
+> `NetFood -> RAW -> vendite normalizzate`.
+>
+> Al termine mostra:
+> - struttura file;
+> - migrations create;
+> - ER diagram Mermaid;
+> - test creati;
+> - comandi esatti per avviare Supabase locale;
+> - eventuali decisioni ancora da prendere.
+
+## 20. DECISIONI DA DEFINIRE PRIMA DELLE INTEGRAZIONI REALI
+
+1. Identificatori realmente disponibili nelle API NetFood.
+2. Logica esatta di `management_date`: sessione cassa, apertura ordine, chiusura ordine, cutoff solo fallback.
+3. Tassonomia definitiva delle fasce gestionali.
+4. Mapping esatto API SuperBill per righe, XML, note credito e scadenze.
+5. Fonte delle presenze del personale.
+6. Livello di automazione del magazzino NetFood.
+7. API banca/Nexi/buoni pasto.
+
+Queste decisioni non bloccano la foundation del Data Hub.
