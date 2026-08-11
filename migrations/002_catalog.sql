@@ -123,9 +123,9 @@ CREATE TABLE core.party_roles (
 );
 
 COMMENT ON TABLE core.party_roles IS
-    'Ruoli di un party nel tempo. Un party può avere più ruoli attivi in '
-    'parallelo (es. supplier e customer); non può avere due periodi '
-    'sovrapposti dello stesso ruolo (uq_party_roles_active).';
+    'Ruoli di un party nel tempo. Un party può avere più ruoli diversi '
+    'attivi contemporaneamente, ma non può avere più di una riga attiva '
+    'dello stesso ruolo (uq_party_roles_active).';
 
 -- Al più un ruolo attivo di un dato tipo per party.
 CREATE UNIQUE INDEX uq_party_roles_active
