@@ -229,6 +229,11 @@ CREATE TABLE raw.ingest_events (
     CONSTRAINT chk_ingest_events_processing_status
         CHECK (processing_status IN ('pending', 'processing', 'processed', 'failed', 'skipped')),
 
+    -- Impedisce temporalità impossibili nel lifecycle dell'evento RAW: un
+    -- evento non può risultare elaborato prima di essere stato ricevuto.
+    CONSTRAINT chk_ingest_events_processed_after_received
+        CHECK (processed_at IS NULL OR processed_at >= received_at),
+
     -- Idempotenza definitiva: nessun duplicato, con o senza external_id,
     -- nessuna collisione tra entity_type diversi, nessuna perdita di
     -- revisioni reali (payload_hash distingue le revisioni quando
